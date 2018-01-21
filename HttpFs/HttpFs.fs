@@ -18,7 +18,7 @@ module internal Prelude =
 
   module Option =
     let orDefault def =
-      Option.fold (fun s t -> t) def
+      Option.defaultValue def
 
   module ASCII =
     open System.Text
@@ -365,6 +365,28 @@ module Client =
       sc.Secure <- x.secure
       sc
 
+  type CacheExpiration =
+    /// Indicate that the client will accept a response no older than a certain age
+    | MaxAge of seconds: uint32
+    /// Indicate that the client will accept an expired response, optionally within sum upper bound.
+    | MaxStale of seconds: uint32 option
+    /// Indicate that the response must be fresh for some bounded amount of remaining time.
+    | MinFresh of seconds: uint32
+
+  /// A type to capture how responses will be served from cache.
+  type CachePolicy =
+    /// Do not serve any request from caches, and do not allow any responses to be set in any caches.
+    | BypassCache
+    /// Serve a response from any cache that has it available, else serve it from the server.
+    /// Provide maxAge, maxStale, and minFresh to control staleness
+    | CacheIfAvailable of ageData: CacheExpiration list
+    /// Serve a response only if it exists in a local cache.
+    | CacheOnly of ageData: CacheExpiration list
+    /// Always serve a response from the server, clearing any intermediate caches.
+    | NoCacheNoStore
+    /// Serve a fresh response from the server, updating any intermediate caches.
+    | Reload
+
   type Request =
     { url                       : Uri
       ``method``                : HttpMethod
@@ -376,7 +398,8 @@ module Client =
       cookies                   : Map<CookieName, Cookie>
       responseCharacterEncoding : Encoding option
       proxy                     : Proxy option
-      httpClient                : HttpClient }
+      httpClient                : HttpClient
+      cachePolicy               : CachePolicy option }
 
   type CharacterSet = string
 
@@ -460,7 +483,7 @@ module Client =
     let getQueryString request =
       if Map.isEmpty request.queryStringItems then ""
       else
-        let items = 
+        let items =
           Map.toList request.queryStringItems
           |> List.collect (fun (k, vs) -> vs |> List.map (fun v -> k,v))
         String.Concat [ uriEncode items ]
@@ -529,7 +552,7 @@ module Client =
         yield writeLineAscii ""
         yield writeLineUtf8 text
 
-      | { typ = "application"; subtype = subtype }, Plain text 
+      | { typ = "application"; subtype = subtype }, Plain text
         when List.exists ((=) (subtype.Split('+') |> Seq.last)) ["json"; "xml"] ->
         yield writeLineAscii ""
         yield writeLineUtf8 text
@@ -688,6 +711,63 @@ module Client =
                 | Custom (customName, customValue) -> add customName customValue)
                 headers
 
+    let setCachePolicy (policy: CachePolicy) (request: HttpRequestMessage) =
+      let noCache (r: HttpRequestMessage) =
+        r.Headers.CacheControl.NoCache <- true
+        r.Headers.Pragma.Add(Headers.NameValueHeaderValue("no-cache"))
+        r
+
+      let onlyCache (r: HttpRequestMessage) =
+        r.Headers.CacheControl.OnlyIfCached <- true
+        r
+
+      let noStore (r: HttpRequestMessage) =
+        r.Headers.CacheControl.NoStore <- true
+        r
+
+      let mustRevalidate (r: HttpRequestMessage) =
+        r.Headers.CacheControl.MustRevalidate <- true
+        r
+
+      let maxAge (seconds: uint32) (r: HttpRequestMessage)=
+        r.Headers.CacheControl.MaxAge <- Nullable.op_Implicit(TimeSpan.FromSeconds(float seconds))
+        r
+
+      let minFresh (seconds: uint32) (r: HttpRequestMessage) =
+        r.Headers.CacheControl.MinFresh <- Nullable.op_Implicit(TimeSpan.FromSeconds(float seconds))
+        r
+
+      let maxStale (seconds: uint32 option) (r: HttpRequestMessage) =
+        r.Headers.CacheControl.MinFresh <-
+          match seconds with
+          | Some s -> Nullable.op_Implicit(TimeSpan.FromSeconds(float s))
+          | None -> Nullable<_>()
+        r
+
+      let applyAgeData (ages: CacheExpiration list) (r: HttpRequestMessage) =
+        ages
+        |> List.fold (
+            fun r a ->
+              match a with
+              | MaxAge s -> maxAge s r
+              | MaxStale s -> maxStale s r
+              | MinFresh s -> minFresh s r ) r
+
+      let actions =
+        match policy with
+        | BypassCache ->
+          noStore >> mustRevalidate
+        | CacheIfAvailable (ageData) ->
+          applyAgeData ageData
+        | CacheOnly (ageData) ->
+          onlyCache >> applyAgeData ageData
+        | NoCacheNoStore ->
+          noCache >> noStore
+        | Reload ->
+          noCache
+
+      actions request |> ignore
+
     // Sets cookies on HttpRequestMessage.
     // Mutates HttpRequestMessage.
     let setCookies (cookies : Cookie list) (url : Uri) (requestMessage: HttpRequestMessage) =
@@ -743,7 +823,6 @@ module Client =
       let methodStr = getMethodAsString request
       let method = new Net.Http.HttpMethod(methodStr)
       let message = new HttpRequestMessage(method, url, Version = HttpVersion.Version11)
-
       let newContentType, writers =
         formatBody state (contentType, contentEncoding, request.body)
 
@@ -763,7 +842,9 @@ module Client =
         if (request.cookiesEnabled) then
           message |> setCookies (request.cookies |> Map.toList |> List.map snd) request.url
 
+        request.cachePolicy |> Option.iter (fun policy -> setCachePolicy policy message)
         message |> setHeaders (request.headers |> Map.toList |> List.map snd)
+
         return message
       }
 
@@ -797,7 +878,7 @@ module Client =
     let getResponseNoException (httpClient: HttpClient) (request : HttpRequestMessage) : Alt<Choice<HttpResponseMessage,exn>> =
       let get = Alt.fromTask (fun cts -> httpClient.SendAsync(request, cts))
       Alt.tryIn get (Choice1Of2 >> Job.result) (Choice2Of2 >> Job.result)
-      
+
     let getCookiesAsMap (response: HttpResponseMessage) =
       let uri = response.RequestMessage.RequestUri
       let container = new System.Net.CookieContainer()
@@ -904,7 +985,7 @@ module Client =
         return Alt.once <| Choice1Of2 { resp with expectedEncoding = request.responseCharacterEncoding }
       | Choice2Of2 x -> return Alt.once <| Choice2Of2 x
     }
-    
+
     Alt.prepare prepare
 
   /// Sends the HTTP request and returns the full response as a Response record, asynchronously.
@@ -931,7 +1012,7 @@ module Client =
 
           | Some enc ->
             enc
-        
+
         use sr = new StreamReader(response.body, charset)
         return! sr.ReadToEndAsync()
       }
@@ -962,7 +1043,8 @@ module Client =
         cookies                   = Map.empty
         responseCharacterEncoding = None
         proxy                     = None
-        httpClient                = defaultHttpClient }
+        httpClient                = defaultHttpClient
+        cachePolicy               = None }
 
     let createWithClient client method url =
       { create method url with httpClient = client }
@@ -1015,7 +1097,7 @@ module Client =
     /// Adds the provided QueryString record onto the request URL.
     /// Multiple items can be appended.
     let queryStringItem (name : QueryStringName) (value : QueryStringValue) request =
-      { request with queryStringItems = 
+      { request with queryStringItems =
                         match request.queryStringItems |> Map.tryFind name with
                         | None -> request.queryStringItems |> Map.add name [value]
                         | Some vs -> request.queryStringItems |> Map.add name (value::vs) }
@@ -1043,7 +1125,14 @@ module Client =
     ///
     /// If this is no set, the proxy settings from IE will be used, if available.
     let proxy proxy request =
-      {request with proxy = Some proxy }
+      { request with proxy = Some proxy }
+
+    /// Sends the request with a given cache policy.
+    ///
+    /// If this is not set, the default cache policy of `BypassCache` will be used,
+    /// unless the machine default has been set through some other mechanism.
+    let cachePolicy policy request =
+      { request with cachePolicy = Some policy }
 
     /// Note: this sends the request, reads the response, disposes it and its stream
     let responseAsString req = job {

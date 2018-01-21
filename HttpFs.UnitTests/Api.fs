@@ -154,4 +154,12 @@ let api =
         |> proxy { Address = ""; Port = 0; Credentials = Credentials.None }
 
       Expect.equal request.proxy.Value.Credentials Credentials.None "credentials should be none"
+
+    testCase "cachePolicy can control the headers that are set" <| fun _ ->
+      let policy = CachePolicy.CacheIfAvailable [MaxAge 120u; MinFresh 300u]
+      let request = 
+        validRequest
+        |> cachePolicy policy
+
+      Expect.equal request.cachePolicy (Some policy) "policy choice is recorded"
   ]
